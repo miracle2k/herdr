@@ -46,7 +46,7 @@ use self::background_agent::{AgentJobStatus, AgentJobTracker};
 pub(crate) use self::terminal::test_encode_key_for_app;
 #[cfg(unix)]
 pub use self::terminal::InputState;
-use self::terminal::{GhosttyPaneTerminal, PaneTerminal};
+use self::terminal::{GhosttyPaneTerminal, PaneTerminal, SynchronizedOutputTimeout};
 pub(crate) use self::terminal::{
     TerminalCompressionStep, TerminalDirtyPatch, TerminalDirtyPatchOutcome, TerminalReadSnapshot,
     TerminalSearchDirection, TerminalSearchWindow, TerminalTextPoint, TerminalWordMotion,
@@ -70,6 +70,42 @@ const RELEASE_REACQUIRE_SUPPRESSION: std::time::Duration = std::time::Duration::
 const TERMINAL_COMPRESSION_IDLE: std::time::Duration = std::time::Duration::from_millis(250);
 const TERMINAL_COMPRESSION_STEP: std::time::Duration = std::time::Duration::from_millis(1);
 pub(crate) const PANE_TERM: &str = crate::ghostty::TERM;
+
+fn schedule_synchronized_output_timeout(
+    runtime: &tokio::runtime::Handle,
+    terminal: &Arc<PaneTerminal>,
+    pane_id: PaneId,
+    render_dirty: &Arc<RenderSignal>,
+    render_notify: &Arc<Notify>,
+    mut delay: std::time::Duration,
+) {
+    // A pane has at most one watchdog, even when a TUI redraws continuously.
+    // Do not keep a closed pane alive while its last timeout is pending.
+    let terminal = Arc::downgrade(terminal);
+    let render_dirty = render_dirty.clone();
+    let render_notify = render_notify.clone();
+    runtime.spawn(async move {
+        loop {
+            tokio::time::sleep(delay).await;
+            let Some(terminal) = terminal.upgrade() else {
+                return;
+            };
+            match terminal
+                .ghostty
+                .poll_synchronized_output_timeout(std::time::Instant::now())
+            {
+                SynchronizedOutputTimeout::Pending(remaining) => delay = remaining,
+                SynchronizedOutputTimeout::Expired => {
+                    if render_dirty.request_pty(pane_id) {
+                        render_notify.notify_one();
+                    }
+                    return;
+                }
+                SynchronizedOutputTimeout::Inactive => return,
+            }
+        }
+    });
+}
 /// Smallest terminal grid a pane is resized to.
 pub(crate) const MIN_PANE_ROWS: u16 = 2;
 pub(crate) const MIN_PANE_COLS: u16 = 4;
@@ -2598,6 +2634,16 @@ impl PaneRuntime {
                 if title_requested || render_requested {
                     render_notify.notify_one();
                 }
+                if let Some(delay) = result.synchronized_output_timeout {
+                    schedule_synchronized_output_timeout(
+                        &delay_rt,
+                        &terminal,
+                        pane_id,
+                        &render_dirty,
+                        &render_notify,
+                        delay,
+                    );
+                }
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
                     let render_dirty = render_dirty.clone();
@@ -2802,6 +2848,16 @@ impl PaneRuntime {
                 let render_requested = result.request_render && render_dirty.request_pty(pane_id);
                 if title_requested || render_requested {
                     render_notify.notify_one();
+                }
+                if let Some(delay) = result.synchronized_output_timeout {
+                    schedule_synchronized_output_timeout(
+                        &rt,
+                        &terminal,
+                        pane_id,
+                        &render_dirty,
+                        &render_notify,
+                        delay,
+                    );
                 }
                 if let Some(delay) = result.render_delay {
                     let render_notify = render_notify.clone();
@@ -4094,6 +4150,69 @@ impl PaneRuntime {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn synchronized_output_watchdog_wakes_rendering_without_further_pty_output() {
+        let pane_id = PaneId::from_raw(1);
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = Arc::new(PaneTerminal::new(
+            GhosttyPaneTerminal::new(
+                crate::ghostty::Terminal::new(80, 24, 0).unwrap(),
+                tx.clone(),
+            )
+            .unwrap(),
+        ));
+        let render_dirty = Arc::new(RenderSignal::new());
+        let render_notify = Arc::new(Notify::new());
+        let result = terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026hPARTIAL", &tx);
+        schedule_synchronized_output_timeout(
+            &tokio::runtime::Handle::current(),
+            &terminal,
+            pane_id,
+            &render_dirty,
+            &render_notify,
+            result.synchronized_output_timeout.unwrap(),
+        );
+        assert!(!render_dirty.is_pending());
+        tokio::time::timeout(std::time::Duration::from_secs(5), render_notify.notified())
+            .await
+            .expect("the watchdog must wake rendering even when the PTY goes silent");
+        assert_eq!(terminal.synchronized_output_state(), (false, 2));
+        let request = render_dirty.take();
+        assert_eq!(
+            request.pty_sources,
+            std::collections::HashSet::from([pane_id])
+        );
+        assert!(
+            !request.generic,
+            "hidden panes must retain normal render filtering"
+        );
+    }
+
+    #[tokio::test]
+    async fn synchronized_output_watchdog_does_not_keep_a_closed_pane_alive() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = Arc::new(PaneTerminal::new(
+            GhosttyPaneTerminal::new(
+                crate::ghostty::Terminal::new(80, 24, 0).unwrap(),
+                tx.clone(),
+            )
+            .unwrap(),
+        ));
+        let pane_id = PaneId::from_raw(1);
+        let result = terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx);
+        schedule_synchronized_output_timeout(
+            &tokio::runtime::Handle::current(),
+            &terminal,
+            pane_id,
+            &Arc::new(RenderSignal::new()),
+            &Arc::new(Notify::new()),
+            result.synchronized_output_timeout.unwrap(),
+        );
+        let weak = Arc::downgrade(&terminal);
+        drop(terminal);
+        assert!(weak.upgrade().is_none());
+    }
+
     use super::*;
     use std::ffi::OsStr;
 
