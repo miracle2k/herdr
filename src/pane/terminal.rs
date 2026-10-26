@@ -42,6 +42,9 @@ use super::{
 
 const DEFAULT_DETECTION_ROWS: usize = 24;
 const KITTY_GRAPHICS_REDRAW_SETTLE: Duration = Duration::from_millis(20);
+// Match Ghostty's terminal I/O watchdog: an interrupted redraw must not hide
+// terminal output indefinitely, including the first frame for a new observer.
+const SYNCHRONIZED_OUTPUT_TIMEOUT: Duration = Duration::from_secs(1);
 const CURSOR_POSITION_SETTLE_ENABLED: bool = cfg!(windows);
 const MODE_MOUSE_X10: u16 = 9;
 const MODE_MOUSE_PRESS_RELEASE: u16 = 1000;
@@ -165,6 +168,7 @@ impl InputState {
 pub(crate) struct ProcessBytesResult {
     pub request_render: bool,
     pub render_delay: Option<Duration>,
+    pub synchronized_output_timeout: Option<Duration>,
     pub terminal_title_changed: bool,
     pub terminal_bells: u16,
     pub clipboard_writes: Vec<Vec<u8>>,
@@ -200,6 +204,8 @@ pub(crate) struct GhosttyPaneCore {
     pub dirty_collection_hook: Option<Box<dyn FnOnce() + Send>>,
     pub terminal: crate::ghostty::Terminal,
     synchronized_output_epoch: u64,
+    synchronized_output_deadline: Option<Instant>,
+    synchronized_output_timer_running: bool,
     #[cfg(windows)]
     recent_fallback: windows_recent_fallback::Cache,
     pub render_state: crate::ghostty::RenderState,
@@ -218,6 +224,12 @@ pub(crate) struct GhosttyPaneCore {
     decscusr_tracker: DecscusrTracker,
     cursor_settle_state: CursorPositionSettleState,
     windows_powershell_prompt_cwd_reporting: bool,
+}
+
+pub(super) enum SynchronizedOutputTimeout {
+    Pending(Duration),
+    Expired,
+    Inactive,
 }
 
 pub(crate) struct PaneTerminal {
@@ -1186,6 +1198,8 @@ impl GhosttyPaneTerminal {
                 dirty_collection_hook: None,
                 terminal,
                 synchronized_output_epoch: 0,
+                synchronized_output_deadline: None,
+                synchronized_output_timer_running: false,
                 #[cfg(windows)]
                 recent_fallback: windows_recent_fallback::Cache::default(),
                 render_state,
@@ -1363,6 +1377,7 @@ impl GhosttyPaneTerminal {
             return ProcessBytesResult {
                 request_render: false,
                 render_delay: None,
+                synchronized_output_timeout: None,
                 terminal_title_changed: false,
                 terminal_bells: 0,
                 clipboard_writes: Vec::new(),
@@ -1446,6 +1461,21 @@ impl GhosttyPaneTerminal {
         if synchronized_output != synchronized_output_before {
             core.synchronized_output_epoch = core.synchronized_output_epoch.wrapping_add(1);
         }
+        let synchronized_output_timeout = if synchronized_output {
+            let now = Instant::now();
+            let deadline = *core
+                .synchronized_output_deadline
+                .get_or_insert(now + SYNCHRONIZED_OUTPUT_TIMEOUT);
+            if core.synchronized_output_timer_running {
+                None
+            } else {
+                core.synchronized_output_timer_running = true;
+                Some(deadline.saturating_duration_since(now))
+            }
+        } else {
+            core.synchronized_output_deadline = None;
+            None
+        };
         // Intermediate synchronized-frame positions must not become settled cursors.
         if CURSOR_POSITION_SETTLE_ENABLED && !synchronized_output {
             let cursor_started = crate::render_prof::timer();
@@ -1480,12 +1510,46 @@ impl GhosttyPaneTerminal {
         ProcessBytesResult {
             request_render,
             render_delay,
+            synchronized_output_timeout,
             terminal_title_changed,
             terminal_bells,
             clipboard_writes,
             reported_cwd,
             terminal_responses,
         }
+    }
+
+    pub(super) fn poll_synchronized_output_timeout(
+        &self,
+        now: Instant,
+    ) -> SynchronizedOutputTimeout {
+        let Ok(mut core) = self.core.lock() else {
+            return SynchronizedOutputTimeout::Inactive;
+        };
+        let synchronized = core
+            .terminal
+            .mode_get(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT)
+            .unwrap_or(false);
+        let deadline = core.synchronized_output_deadline.filter(|_| synchronized);
+        let Some(deadline) = deadline else {
+            core.synchronized_output_deadline = None;
+            core.synchronized_output_timer_running = false;
+            return SynchronizedOutputTimeout::Inactive;
+        };
+        if now < deadline {
+            return SynchronizedOutputTimeout::Pending(deadline.duration_since(now));
+        }
+        if let Err(err) = core
+            .terminal
+            .mode_set(crate::ghostty::MODE_SYNCHRONIZED_OUTPUT, false)
+        {
+            warn!(%err, "failed to release expired synchronized output");
+            return SynchronizedOutputTimeout::Pending(SYNCHRONIZED_OUTPUT_TIMEOUT);
+        }
+        core.synchronized_output_deadline = None;
+        core.synchronized_output_timer_running = false;
+        core.synchronized_output_epoch = core.synchronized_output_epoch.wrapping_add(1);
+        SynchronizedOutputTimeout::Expired
     }
 
     fn write_pty_bytes_with_ordered_responses(
@@ -1734,6 +1798,9 @@ impl GhosttyPaneTerminal {
                 .unwrap_or(false);
             if synchronized_output_after != synchronized_output_before {
                 core.synchronized_output_epoch = core.synchronized_output_epoch.wrapping_add(1);
+            }
+            if !synchronized_output_after {
+                core.synchronized_output_deadline = None;
             }
             let terminal_responses = self.drain_pending_pty_responses();
 
@@ -6205,15 +6272,128 @@ mod tests {
 
         let begin = pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx);
         assert!(!begin.request_render);
+        assert_eq!(
+            begin.synchronized_output_timeout,
+            Some(SYNCHRONIZED_OUTPUT_TIMEOUT)
+        );
         assert_eq!(pane_terminal.synchronized_output_state(), (true, 1));
 
         let body = pane_terminal.process_pty_bytes(pane_id, 0, b"hello", &tx);
         assert!(!body.request_render);
+        assert_eq!(body.synchronized_output_timeout, None);
         assert_eq!(pane_terminal.synchronized_output_state(), (true, 1));
 
         let end = pane_terminal.process_pty_bytes(pane_id, 0, b"\x1b[?2026l", &tx);
         assert!(end.request_render);
         assert_eq!(pane_terminal.synchronized_output_state(), (false, 2));
+    }
+
+    #[test]
+    fn synchronized_output_timeout_releases_a_silent_terminal_without_resizing() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026hPARTIAL", &tx);
+        let deadline = pane
+            .core
+            .lock()
+            .unwrap()
+            .synchronized_output_deadline
+            .unwrap();
+
+        assert!(matches!(
+            pane.poll_synchronized_output_timeout(deadline - Duration::from_millis(1)),
+            SynchronizedOutputTimeout::Pending(delay) if delay == Duration::from_millis(1)
+        ));
+        assert_eq!(pane.synchronized_output_state(), (true, 1));
+        assert!(matches!(
+            pane.poll_synchronized_output_timeout(deadline),
+            SynchronizedOutputTimeout::Expired
+        ));
+        assert_eq!(pane.synchronized_output_state(), (false, 2));
+        let core = pane.core.lock().unwrap();
+        assert_eq!(core.terminal.cols().unwrap(), 80);
+        assert_eq!(core.terminal.rows().unwrap(), 24);
+    }
+
+    #[test]
+    fn synchronized_output_body_cannot_extend_the_timeout_or_spawn_more_watchdogs() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx);
+        let deadline = pane
+            .core
+            .lock()
+            .unwrap()
+            .synchronized_output_deadline
+            .unwrap();
+        for _ in 0..100 {
+            let body = pane.process_pty_bytes(pane_id, 0, b"\rUPDATE\x1b[?2026l\x1b[?2026h", &tx);
+            assert_eq!(body.synchronized_output_timeout, None);
+        }
+        assert_eq!(
+            pane.core.lock().unwrap().synchronized_output_deadline,
+            Some(deadline)
+        );
+        assert!(matches!(
+            pane.poll_synchronized_output_timeout(deadline),
+            SynchronizedOutputTimeout::Expired
+        ));
+    }
+
+    #[test]
+    fn synchronized_output_old_timer_waits_for_a_new_batch_and_ignores_completed_output() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        let pane_id = PaneId::from_raw(1);
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx);
+        // The first timer is already due when this batch ends. Its queued
+        // callback must follow the new batch's deadline, rather than release it.
+        let old_deadline = Instant::now();
+        pane.core.lock().unwrap().synchronized_output_deadline = Some(old_deadline);
+        pane.process_pty_bytes(pane_id, 0, b"FIRST\x1b[?2026l", &tx);
+        let second = pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026hSECOND", &tx);
+        assert_eq!(second.synchronized_output_timeout, None);
+        assert!(matches!(
+            pane.poll_synchronized_output_timeout(old_deadline),
+            SynchronizedOutputTimeout::Pending(_)
+        ));
+        assert_eq!(pane.synchronized_output_state(), (true, 3));
+        pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026l", &tx);
+        assert!(matches!(
+            pane.poll_synchronized_output_timeout(old_deadline + SYNCHRONIZED_OUTPUT_TIMEOUT),
+            SynchronizedOutputTimeout::Inactive
+        ));
+        assert_eq!(pane.synchronized_output_state(), (false, 4));
+        let next = pane.process_pty_bytes(pane_id, 0, b"\x1b[?2026h", &tx);
+        assert_eq!(
+            next.synchronized_output_timeout,
+            Some(SYNCHRONIZED_OUTPUT_TIMEOUT)
+        );
+    }
+
+    #[test]
+    fn synchronized_output_resize_cancels_the_old_deadline() {
+        let (tx, _rx) = mpsc::channel(4);
+        let terminal = crate::ghostty::Terminal::new(80, 24, 0).unwrap();
+        let pane = GhosttyPaneTerminal::new(terminal, tx.clone()).unwrap();
+        pane.process_pty_bytes(PaneId::from_raw(1), 0, b"\x1b[?2026h", &tx);
+        let deadline = pane
+            .core
+            .lock()
+            .unwrap()
+            .synchronized_output_deadline
+            .unwrap();
+        pane.resize(30, 60, 0, 0);
+        assert!(matches!(
+            pane.poll_synchronized_output_timeout(deadline),
+            SynchronizedOutputTimeout::Inactive
+        ));
+        assert_eq!(pane.synchronized_output_state(), (false, 2));
     }
 
     #[test]
